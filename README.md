@@ -52,4 +52,46 @@ This works with any `ssh` client that reads `~/.ssh/config`: Apple's
 `/usr/bin/ssh`, Homebrew's, and VS Code Remote-SSH, which needs no extra
 setting.
 
+## Troubleshooting
+
+If the SYN carries no `MP_CAPABLE` option and `make check` says *You are not
+using MPTCP*, the connection fell back to plain TCP. `ssh-mptcp` detects this
+and warns on stderr:
+
+```
+ssh-mptcp: warning: host port 22 connected without MPTCP; this is plain TCP
+ssh-mptcp: the system refused multipath for this route; a VPN or a filtering
+           network extension is the usual cause (-q silences this)
+```
+
+Network.framework reports the connection as `ready` whether or not it got
+multipath, so the check asks the kernel instead: an MPTCP connection is backed
+by a socket in the `PF_MULTIPATH` domain, a plain one by `AF_INET`.
+
+The common causes, in order:
+
+* **A VPN or filtering network extension owns the route.** Enterprise VPN and
+  endpoint-security clients install a socket or content-filter network
+  extension that attaches a *flow divert* agent to the path.
+  Network.framework cannot run MPTCP over a diverted flow and silently
+  downgrades it. These products are often split-tunnel, so hosts that bypass
+  the tunnel keep MPTCP while everything else loses it — which is why
+  `make check` can fail on a machine where `ssh` works. Confirm with:
+
+  ```
+  log stream --debug --predicate 'process == "ssh-mptcp" AND category == "connection"'
+  ```
+
+  A working connection builds a `multipath-socket-flow`; a downgraded one
+  builds a plain `socket-flow` and its path reads `flow divert agg: N`.
+
+* **MPTCP is off in the kernel.** `sysctl net.inet.mptcp.enable` must be `1`.
+
+* **The server does not speak MPTCP.** Here the SYN *does* carry `MP_CAPABLE`
+  and the socket stays `PF_MULTIPATH`; the kernel falls back after the
+  handshake, so no warning is printed.
+
+`sysctl -n net.inet.mptcp.pcbcount` is a quick root-free check: it goes up by
+one while a real MPTCP connection is open.
+
 Check https://perso.uclouvain.be/tom.barbette/tired-of-ssh-and-claude-getting-frozen-when-you-switch-to-wifi-use-mptcp-on-macos/ for the full story

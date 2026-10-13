@@ -15,15 +15,25 @@
 #include <dispatch/dispatch.h>
 
 #include <errno.h>
+#include <libproc.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/proc_info.h>
 #include <unistd.h>
 
 #define RELAY_CHUNK (64 * 1024)
+
+/*
+ * PF_MULTIPATH is the domain of the kernel's MPTCP sockets, but it is only
+ * declared in the private part of <sys/socket.h>, so spell it out here.
+ */
+#ifndef AF_MULTIPATH
+#define AF_MULTIPATH 39
+#endif
 
 static nw_connection_t conn;
 static dispatch_queue_t net_q;   /* connection events, stdin -> network */
@@ -31,6 +41,7 @@ static dispatch_queue_t out_q;   /* network -> stdout (blocking writes) */
 static dispatch_source_t in_src;
 static bool ready;
 static int verbose;
+static bool quiet;
 static const char *host, *port;
 static uint8_t in_buf[RELAY_CHUNK];
 
@@ -92,6 +103,66 @@ log_path(const char *what, nw_path_t path)
 		nw_release(remote);
 	}
 	fputc('\n', stderr);
+}
+
+/*
+ * Network.framework silently downgrades to plain TCP when the system refuses
+ * multipath (a VPN or a filtering network extension claiming the route, a
+ * proxied path, ...). nw_connection reports "ready" either way, so ask the
+ * kernel what it actually gave us: an MPTCP connection is backed by a socket
+ * in the PF_MULTIPATH domain, a plain one by AF_INET/AF_INET6.
+ */
+static bool
+mptcp_socket_present(void)
+{
+	struct proc_fdinfo *fds;
+	pid_t pid = getpid();
+	bool found = false;
+	int sz, n, i;
+
+	if ((sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, NULL, 0)) <= 0)
+		return false;
+	if ((fds = malloc((size_t)sz)) == NULL)
+		return false;
+	if ((sz = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds, sz)) <= 0) {
+		free(fds);
+		return false;
+	}
+	n = sz / (int)sizeof(*fds);
+	for (i = 0; i < n; i++) {
+		struct socket_fdinfo si;
+
+		if (fds[i].proc_fdtype != PROX_FDTYPE_SOCKET)
+			continue;
+		if (proc_pidfdinfo(pid, fds[i].proc_fd, PROC_PIDFDSOCKETINFO,
+		    &si, sizeof(si)) != (int)sizeof(si))
+			continue;
+		if (si.psi.soi_family == AF_MULTIPATH) {
+			found = true;
+			break;
+		}
+	}
+	free(fds);
+	return found;
+}
+
+static void
+report_multipath(nw_multipath_service_t svc)
+{
+	if (svc == nw_multipath_service_disabled)
+		return;
+	if (mptcp_socket_present()) {
+		vlog("MPTCP in use (PF_MULTIPATH socket)");
+		return;
+	}
+	if (quiet)
+		return;
+	fprintf(stderr, "ssh-mptcp: warning: %s port %s connected without "
+	    "MPTCP; this is plain TCP and will not survive a network change\n",
+	    host, port);
+	fprintf(stderr, "ssh-mptcp: the system refused multipath for this "
+	    "route; a VPN or a filtering network extension is the usual cause "
+	    "(-q silences this)\n");
 }
 
 /* network -> stdout */
@@ -183,12 +254,13 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: ssh-mptcp [-v] [-4|-6] [-s] [-k secs] [-t secs]\n"
+	    "usage: ssh-mptcp [-v] [-q] [-4|-6] [-s] [-k secs] [-t secs]\n"
 	    "                 [-m none|handover|interactive|aggregate] host port\n"
 	    "  -m  multipath service (default: interactive)\n"
 	    "  -s  wrap in TLS (testing, e.g. check.mptcp.dev 443)\n"
 	    "  -k  TCP keepalive idle time in seconds (default: off)\n"
 	    "  -t  connection timeout in seconds (default: system)\n"
+	    "  -q  do not warn when the connection falls back to plain TCP\n"
 	    "  -v  log path/interface changes to stderr\n");
 	exit(255);
 }
@@ -202,11 +274,12 @@ main(int argc, char **argv)
 	bool tls = false;
 	int ch;
 
-	while ((ch = getopt(argc, argv, "46k:m:st:v")) != -1) {
+	while ((ch = getopt(argc, argv, "46k:m:qst:v")) != -1) {
 		switch (ch) {
 		case '4': ipver = nw_ip_version_4; break;
 		case '6': ipver = nw_ip_version_6; break;
 		case 'k': keepalive = (uint32_t)strtoul(optarg, NULL, 10); break;
+		case 'q': quiet = true; break;
 		case 's': tls = true; break;
 		case 't': timeout = (uint32_t)strtoul(optarg, NULL, 10); break;
 		case 'v': verbose++; break;
@@ -288,6 +361,7 @@ main(int argc, char **argv)
 			log_path("ready", p);
 			if (p != NULL)
 				nw_release(p);
+			report_multipath(svc);
 			start_stdin();
 			receive_loop();
 			break;
